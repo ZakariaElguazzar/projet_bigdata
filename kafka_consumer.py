@@ -10,3 +10,7 @@ consumer = KafkaConsumer(
 
 for message in consumer:
     print(f"Received: {message.value}")
+
+
+
+
