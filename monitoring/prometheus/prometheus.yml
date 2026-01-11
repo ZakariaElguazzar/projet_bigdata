@@ -1,0 +1,19 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  # Job pour Prometheus lui-même
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Job pour Hadoop (Namenode/Datanode via JMX)
+  - job_name: 'hadoop'
+    static_configs:
+      - targets: ['namenode:7000', 'datanode:7001']
+
+  # === AJOUTEZ CECI ===
+  # Job pour votre Exporter HDFS Python
+  - job_name: 'hdfs-exporter'
+    static_configs:
+      - targets: ['hdfs-exporter:8000']

@@ -24,36 +24,36 @@ services:
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_INTERNAL://0.0.0.0:29092
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT_INTERNAL
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
     volumes:
       - kafka-data:/var/lib/kafka/data
 
-      # -----------------------------
+  #-----------------------------
+  # KAFKA PRODUCER (Python)
+  #-----------------------------
+  kafka-producer:
+    build: ./producer
+    container_name: kafka-producer
+    depends_on:
+      - kafka
+    restart: unless-stopped
+
+  # -----------------------------
   # KAFKA CONSUMER (Python)
   # -----------------------------
   kafka-consumer:
-    image: python:3.11-slim
+    build: ./consumer
     container_name: kafka-consumer
     depends_on:
       - kafka
       - namenode
       - datanode
-    volumes:
-      - ./kafka_to_hdfs_copy.py:/app/kafka_to_hdfs_copy.py
-    working_dir: /app
-    command: >
-      bash -c "
-      pip install kafka-python hdfs pyarrow &&
-      python kafka_to_hdfs_copy.py
-      "
-
-
-
+      - kafka-producer
+    restart: unless-stopped
+    
 
   # -----------------------------
   # HDFS NAMENODE
@@ -62,18 +62,25 @@ services:
     image: apache/hadoop:3.3.6
     container_name: namenode
     hostname: namenode
-    command: ["hdfs", "namenode"]
+    command: >
+      bash -c "
+      hdfs namenode &&
+      /opt/hadoop-init/hdfs-init.sh
+      "
     ports:
-      - "9870:9870"   # Web UI
-      - "8020:8020"   # RPC port
-      - "7000:7000"   # JMX exporter
+      - "9870:9870"
+      - "8020:8020"
+      - "7000:7000"
     volumes:
       - ./monitoring/jmx:/opt/jmx:ro
+      - ./hdfs-init.sh:/opt/hadoop-init/hdfs-init.sh
     environment:
       ENSURE_NAMENODE_DIR: "/tmp/hadoop-root/dfs/name"
       HADOOP_NAMENODE_OPTS: "-javaagent:/opt/jmx/jmx_prometheus_javaagent-0.20.0.jar=7000:/opt/jmx/hadoop.yml"
     env_file:
       - ./config
+
+
   # -----------------------------
   # HDFS DATANODE
   # -----------------------------
@@ -93,20 +100,33 @@ services:
       - ./config
 
   # -----------------------------
-  # SPARK
+  # SPARK MASTER
   # -----------------------------
   spark-master:
     image: spark:latest
     hostname: spark-master
     container_name: spark-master
-    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master",
-              "--host", "spark-master", "--port", "7077", "--webui-port", "8080"]
-    ports: ["7077:7077", "8080:8080"]
+    ports:
+      - "7077:7077"
+      - "8080:8080"
     volumes:
       - ./spark:/opt/spark/apps
-    depends_on: [namenode]
-    
+      - ./config:/opt/hadoop/etc/hadoop
+    environment:
+      - HADOOP_CONF_DIR=/opt/hadoop/etc/hadoop
+    depends_on:
+      - namenode
+    command: >
+      bash -c "
+      chmod +x /opt/spark/apps/start-spark-jobs.sh &&
+      /opt/spark/apps/start-spark-jobs.sh
+      "
+    restart: unless-stopped
 
+
+  # -----------------------------
+  # SPARK WORKER
+  # -----------------------------
   spark-worker-1:
     image: spark:latest
     hostname: spark-worker-1
@@ -115,10 +135,114 @@ services:
               "spark://spark-master:7077"]
     volumes:
       - ./spark:/opt/spark/apps
-    depends_on: [spark-master]
+      - ./config:/opt/hadoop/etc/hadoop
+    environment:
+      - HADOOP_CONF_DIR=/opt/hadoop/etc/hadoop
+    depends_on:
+      - spark-master
+    restart: unless-stopped
+
+  # -----------------------------
+  # HDFS EXPORTER (BRIDGE)
+  # -----------------------------
+  hdfs-exporter:
+    build: ./exporter
+    container_name: hdfs-exporter
+    ports:
+      - "8000:8000"
+    depends_on:
+      - namenode
+    restart: unless-stopped
+
+  # -----------------------------
+  # PROMETHEUS
+  # -----------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - namenode
+      - datanode
+
+  # -----------------------------
+  # GRAFANA
+  # -----------------------------
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+
+  # -----------------------------
+  # APACHE AIRFLOW
+  # -----------------------------
+
+  airflow-db:
+    image: postgres:13
+    container_name: airflow-db
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
+
+  airflow-webserver:
+    image: apache/airflow:2.8.1
+    container_name: airflow-webserver
+    depends_on:
+      - airflow-db
+      - spark-master
+      - kafka
+      - namenode
+
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__FERNET_KEY: ""
+      AIRFLOW__WEBSERVER__RBAC: "True"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+    ports:
+      - "8085:8080"
+    command: >
+      bash -c "
+      airflow db init &&
+      airflow users create --username admin --firstname Air --lastname Flow --role Admin --email admin@example.com --password admin &&
+      airflow webserver
+      "
+
+  airflow-scheduler:
+    image: apache/airflow:2.8.1
+    container_name: airflow-scheduler
+    depends_on:
+      - airflow-webserver
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db/airflow
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+    command: scheduler
+    restart: unless-stopped
+
 
 volumes:
   kafka-data:
   namenode-data:
   datanode-data:
-  
+  airflow-db-data:
